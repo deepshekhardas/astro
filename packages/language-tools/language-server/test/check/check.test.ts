@@ -27,7 +27,9 @@ describe('AstroCheck', async () => {
 
 	it('Can check files and return errors', async () => {
 		assert.notStrictEqual(result, undefined);
-		assert.strictEqual(result.fileResult.length, 4);
+		// fileWithHints.astro only has unused variable suggestions (ts(6133)) which are filtered
+		// out in CLI mode since noUnusedLocals is not enabled
+		assert.strictEqual(result.fileResult.length, 3);
 	});
 
 	it("Returns the file's URL", async () => {
@@ -46,7 +48,8 @@ describe('AstroCheck', async () => {
 	it('Can return the total amount of errors, warnings and hints', async () => {
 		assert.strictEqual(result.errors, 2);
 		assert.strictEqual(result.warnings, 1);
-		assert.strictEqual(result.hints, 1);
+		// Unused variable hints (ts(6133)) are filtered out in CLI mode to match tsc behavior
+		assert.strictEqual(result.hints, 0);
 	});
 
 	it('Can return the total amount of files checked', async () => {

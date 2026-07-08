@@ -30,6 +30,10 @@ export interface CheckResult {
 	}[];
 }
 
+/** Diagnostic codes for unused declarations, reported by TypeScript's getSuggestionDiagnostics */
+const TS_DECLARED_BUT_NEVER_READ = 6133;
+const TS_DECLARED_BUT_NEVER_USED = 6196;
+
 export class AstroCheck {
 	private ts!: typeof import('typescript');
 	public linter!: ReturnType<(typeof kit)['createTypeScriptChecker']>;
@@ -88,7 +92,24 @@ export class AstroCheck {
 				result.status = 'cancelled';
 				return result;
 			}
-			const fileDiagnostics = await this.linter.check(file);
+			const allDiagnostics = await this.linter.check(file);
+
+			// TypeScript's getSuggestionDiagnostics always reports unused variables/parameters
+			// as hint-level diagnostics (ts(6133), ts(6196)), regardless of noUnusedLocals/
+			// noUnusedParameters settings. These suggestion diagnostics are useful in editors
+			// (shown as faded text) but should not appear in CLI output to match tsc behavior.
+			// When noUnusedLocals/noUnusedParameters are enabled, the corresponding diagnostics
+			// are already reported as errors through getSemanticDiagnostics, making the
+			// hint-level duplicates redundant.
+			const fileDiagnostics = allDiagnostics.filter((diag) => {
+				if (
+					diag.severity === DiagnosticSeverity.Hint &&
+					(diag.code === TS_DECLARED_BUT_NEVER_READ || diag.code === TS_DECLARED_BUT_NEVER_USED)
+				) {
+					return false;
+				}
+				return true;
+			});
 
 			// Filter diagnostics based on the logErrors level
 			const fileDiagnosticsToPrint = fileDiagnostics.filter((diag) => {
