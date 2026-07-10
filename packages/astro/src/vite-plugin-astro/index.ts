@@ -1,5 +1,5 @@
 import type * as vite from 'vite';
-import { defaultClientConditions, defaultServerConditions, normalizePath } from 'vite';
+import { defaultClientConditions, defaultServerConditions, normalizePath, transformWithOxc } from 'vite';
 import { ASTRO_VITE_ENVIRONMENT_NAMES } from '../core/constants.js';
 import type { AstroLogger } from '../core/logger/core.js';
 import { isAstroServerEnvironment } from '../environments.js';
@@ -30,7 +30,10 @@ const astroFileToCompileMetadataWeakMap = new WeakMap<AstroConfig, Map<string, C
 export default function astro({ settings, logger }: AstroPluginOptions): vite.Plugin[] {
 	const { config } = settings;
 	let server: vite.ViteDevServer | undefined;
+	let resolvedViteConfig: vite.ResolvedConfig | undefined;
 	let compile: (code: string, filename: string) => Promise<CompileAstroResult>;
+	const useExperimentalDecorators =
+		settings.tsConfig?.compilerOptions?.experimentalDecorators === true;
 	// Each Astro file has its own compile metadata so that its scripts and styles virtual module
 	// can retrieve their code from here.
 	// NOTE: We need to initialize a map here and in `buildStart` because our unit tests don't
@@ -94,6 +97,7 @@ export default function astro({ settings, logger }: AstroPluginOptions): vite.Pl
 				}
 			},
 			async configResolved(viteConfig) {
+				resolvedViteConfig = viteConfig;
 				const toolbarEnabled = await settings.preferences.get('devToolbar.enabled');
 				// Initialize `compile` function to simplify usage later
 				compile = (code, filename) => {
@@ -294,9 +298,34 @@ export default function astro({ settings, logger }: AstroPluginOptions): vite.Pl
 						pageOptions: {},
 					};
 
+					let { code, map } = transformResult;
+
+					// Vite 8's `vite:oxc` plugin only matches .ts/.tsx/.jsx/.mts files, so .astro
+					// files skip OXC transforms entirely. When the user's tsconfig enables
+					// `experimentalDecorators`, we need to run OXC ourselves to transpile
+					// decorator syntax that the Astro compiler preserves in its output.
+					if (useExperimentalDecorators) {
+						const oxcResult = await transformWithOxc(
+							code,
+							filename,
+							{
+								lang: 'ts',
+								decorator: {
+									legacy: true,
+									emitDecoratorMetadata:
+										settings.tsConfig?.compilerOptions?.emitDecoratorMetadata === true,
+								},
+							},
+							undefined,
+							resolvedViteConfig,
+						);
+						code = oxcResult.code;
+						map = oxcResult.map as typeof map;
+					}
+
 					return {
-						code: transformResult.code,
-						map: transformResult.map,
+						code,
+						map,
 						moduleType: 'ts',
 						meta: {
 							astro: astroMetadata,
