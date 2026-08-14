@@ -1,6 +1,7 @@
 import colors from 'piccolore';
 import {
 	collapseDuplicateLeadingSlashes,
+	collapseDuplicateSlashes,
 	prependForwardSlash,
 	removeTrailingForwardSlash,
 } from '@astrojs/internal-helpers/path';
@@ -12,16 +13,15 @@ import type { Params, Props, RewritePayload } from '../../types/public/common.js
 import type { APIContext, AstroGlobal } from '../../types/public/context.js';
 import type { RouteData, SSRResult } from '../../types/public/internal.js';
 import { AstroCookies } from '../cookies/index.js';
-import { type Pipeline, Slots } from '../render/index.js';
+import { Slots } from '../render/index.js';
 import {
-	appSymbol,
 	ASTRO_GENERATOR,
 	fetchStateSymbol,
 	originPathnameSymbol,
-	pipelineSymbol,
 	responseSentSymbol,
 } from '../constants.js';
-import { pushDirective } from '../csp/runtime.js';
+import type { CspKind } from '../csp/config.js';
+import { normalizeCspResourceEntry, pushDirective } from '../csp/runtime.js';
 import { generateCspDigest } from '../encryption.js';
 import { AstroError, AstroErrorData } from '../errors/index.js';
 import {
@@ -32,16 +32,47 @@ import {
 } from '../../i18n/utils.js';
 
 import { getParams, getProps } from '../render/index.js';
-import { Rewrites } from '../rewrites/handler.js';
+import { executeRewrite } from '../rewrites/handler.js';
 import { isRoute404or500, isRouteServerIsland } from '../routing/match.js';
-import { normalizeUrl } from '../util/normalized-url.js';
 import { MultiLevelEncodingError, validateAndDecodePathname } from '../util/pathname.js';
 import { getOriginPathname, setOriginPathname } from '../routing/rewrite.js';
 import { computePathnameFromDomain } from '../i18n/domain.js';
 import { getCustom404Route, routeHasHtmlExtension } from '../routing/helpers.js';
-import type { ResolvedRenderOptions } from '../app/base.js';
+import type { RenderErrorOptions, ResolvedRenderOptions } from '../app/base.js';
 import { getRenderOptions } from '../app/render-options.js';
 import { getFirstForwardedValue, validateForwardedHeaders } from '../app/validate-headers.js';
+import type { SSRManifest } from '../app/types.js';
+import { getEnvironment, type RequestLogPayload } from '../environment/index.js';
+import { getLogger } from '../logger/manifest-logger.js';
+import type { AstroLogger } from '../logger/core.js';
+import { getSite } from '../manifest/derived.js';
+import { getRouteCache } from '../render/route-cache.js';
+import { getRouteTable, matchAllRoutes, matchRoute } from '../routing/route-table.js';
+import { getServerIslands } from '../server-islands/mappings.js';
+
+/**
+ * Per-render facade inputs passed by `BaseApp.render`'s fast path to the
+ * internal `FetchState` constructor and stored as plain state fields.
+ *
+ * MEMBERSHIP CLAMP: frozen at `{ streaming?, renderError?, logRequest? }`.
+ * Any addition must be facade-INSTANCE behavior — something a public
+ * overridable/reassignable method dispatches — never static or per-manifest
+ * data. This type is never exported from a public entrypoint;
+ * only `BaseApp.render` constructs it; only the `FetchState` constructor
+ * consumes it; it is never stored on a request, in a registry, or passed to
+ * any other function.
+ */
+export interface FacadeHooks {
+	/** Overrides the environment's `defaultStreaming` for this render. */
+	streaming?: boolean;
+	/**
+	 * Late-bound `app.renderError` dispatch for deep chain-internal error
+	 * reroutes (preserves cloudflare's instance-property reassignment).
+	 */
+	renderError?: (request: Request, options: RenderErrorOptions) => Promise<Response>;
+	/** Late-bound `app.logThisRequest` dispatch (dev request lines). */
+	logRequest?: (payload: RequestLogPayload) => void;
+}
 
 /**
  * Describes a lazily-created value that handlers can contribute to the
@@ -126,7 +157,27 @@ export function getFetchStateFromAPIContext(context: APIContext): FetchState {
  * for rarely-accessed memoized caches and Maps.
  */
 export class FetchState implements AstroFetchState {
-	pipeline: Pipeline;
+	/** The manifest — the single ambient source of static, build-time data. */
+	manifest: SSRManifest;
+	/** The manifest's identity-stable logger, captured once at construction. */
+	logger: AstroLogger;
+	/**
+	 * Whether page renders stream. From the facade hooks on the fast path,
+	 * else the environment's default.
+	 */
+	streaming: boolean;
+	/**
+	 * Internal facade hook: late-bound `app.renderError` dispatch. Undefined on
+	 * bare and custom-handler paths — those fall through to the environment's
+	 * error strategy (`renderErrorPage`).
+	 */
+	renderError: ((request: Request, options: RenderErrorOptions) => Promise<Response>) | undefined;
+	/**
+	 * Internal facade hook: late-bound `app.logThisRequest` dispatch. Undefined
+	 * on bare and custom-handler paths — those fall through to the
+	 * environment's `logRequest` behavior.
+	 */
+	logRequest: ((payload: RequestLogPayload) => void) | undefined;
 	/**
 	 * The request to render. Mutated during rewrites so subsequent renders
 	 * see the rewritten URL.
@@ -136,7 +187,7 @@ export class FetchState implements AstroFetchState {
 	/**
 	 * The pathname to use for routing and rendering. Starts out as the raw,
 	 * base-stripped, decoded pathname from the request. May be further
-	 * normalized by `AstroHandler` after routeData is known (in dev, when
+	 * normalized by `handleRequest` after routeData is known (in dev, when
 	 * the matched route has no `.html` extension, `.html` / `/index.html`
 	 * suffixes are stripped).
 	 */
@@ -164,7 +215,7 @@ export class FetchState implements AstroFetchState {
 	response: Response | undefined;
 	/**
 	 * Default HTTP status for the rendered response. Callers override
-	 * before rendering runs (e.g. `AstroHandler` sets this from
+	 * before rendering runs (e.g. `handleRequest` sets this from
 	 * `BaseApp.getDefaultStatusCode`; error handlers set `404` / `500`).
 	 */
 	status = 200;
@@ -229,8 +280,6 @@ export class FetchState implements AstroFetchState {
 	result: SSRResult | undefined;
 	/** Initial props (from container/error handler). */
 	initialProps: Props = {};
-	/** Rewrites handler instance. Lazy-initialized on first rewrite(). */
-	#rewrites: Rewrites | undefined;
 	/** Memoized Astro page partial. */
 	#astroPagePartial?: Omit<AstroGlobal, 'props' | 'self' | 'slots'>;
 	/**
@@ -247,26 +296,44 @@ export class FetchState implements AstroFetchState {
 	/** Memoized preferred locale list. */
 	#preferredLocaleList: APIContext['preferredLocaleList'];
 
-	constructor(pipeline: Pipeline, request: Request, options?: ResolvedRenderOptions) {
-		this.pipeline = pipeline;
+	constructor(
+		manifest: SSRManifest,
+		request: Request,
+		options?: ResolvedRenderOptions,
+		hooks?: FacadeHooks,
+	) {
+		this.manifest = manifest;
+		this.logger = getLogger(manifest);
+		this.streaming = hooks?.streaming ?? getEnvironment(manifest).defaultStreaming(manifest);
+		this.renderError = hooks?.renderError;
+		this.logRequest = hooks?.logRequest;
 		this.request = request;
 		// Accept options directly (fast path from BaseApp.render) or fall
 		// back to reading them from the request symbol (user fetch handlers).
 		options ??= getRenderOptions(request);
 		this.routeData = options?.routeData;
-		this.renderOptions = options ?? {
-			addCookieHeader: false,
-			clientAddress: undefined,
-			locals: undefined,
-			prerenderedErrorPageFetch: fetch,
-			routeData: undefined,
-			waitUntil: undefined,
+		const self = this;
+		this.renderOptions = {
+			...(options ?? {
+				addCookieHeader: false,
+				clientAddress: undefined,
+				prerenderedErrorPageFetch: fetch,
+				routeData: undefined,
+				waitUntil: undefined,
+			}),
+			get locals() {
+				return self.locals;
+			},
 		};
 
 		this.componentInstance = undefined;
 		this.slots = undefined;
 		// Parse the URL once and derive both pathname and url from it.
 		const url = new URL(request.url);
+		const publicPathname = this.#normalizePathname(url.pathname);
+		const pathname = this.#computePathname(publicPathname);
+		url.pathname = publicPathname;
+		url.pathname = collapseDuplicateSlashes(url.pathname);
 		// For domain-based i18n routing, the locale prefix is derived from the
 		// request's Host header rather than its URL. When a locale is detected,
 		// the resulting pathname includes the prefix (e.g. /en/boats/1/foo) that
@@ -275,25 +342,22 @@ export class FetchState implements AstroFetchState {
 		const domainPathname = computePathnameFromDomain(
 			request,
 			url,
-			pipeline.manifest.i18n,
-			pipeline.manifest.base,
-			pipeline.manifest.trailingSlash,
-			pipeline.logger,
+			manifest.i18n,
+			manifest.base,
+			manifest.trailingSlash,
+			this.logger,
+			pathname,
 		);
 		if (domainPathname) {
 			this.#domainPathname = domainPathname;
-			try {
-				this.pathname = decodeURI(domainPathname);
-			} catch {
-				this.pathname = domainPathname;
-			}
+			this.pathname = domainPathname;
 		} else {
-			this.pathname = this.#computePathname(url);
+			this.pathname = pathname;
 		}
 		this.timeStart = performance.now();
 		this.clientAddress = options?.clientAddress;
 		this.locals = (options?.locals ?? {}) as App.Locals;
-		this.url = normalizeUrl(url);
+		this.url = url;
 		this.cookies = new AstroCookies(request);
 
 		// Apply X-Forwarded-* headers only when the user has configured
@@ -301,8 +365,8 @@ export class FetchState implements AstroFetchState {
 		// and the validation is a no-op. This avoids header lookups on the
 		// hot path for the vast majority of apps.
 		if (
-			pipeline.manifest.allowedDomains &&
-			pipeline.manifest.allowedDomains.length > 0 &&
+			manifest.allowedDomains &&
+			manifest.allowedDomains.length > 0 &&
 			!this.routeData?.prerender
 		) {
 			this.#applyForwardedHeaders();
@@ -312,12 +376,7 @@ export class FetchState implements AstroFetchState {
 		// (not the local parameter) because #applyForwardedHeaders()
 		// may have reconstructed it with a forwarded URL.
 		if (!Reflect.get(this.request, originPathnameSymbol)) {
-			setOriginPathname(
-				this.request,
-				this.pathname,
-				pipeline.manifest.trailingSlash,
-				pipeline.manifest.buildFormat,
-			);
+			setOriginPathname(this.request, this.pathname, manifest.trailingSlash, manifest.buildFormat);
 		}
 
 		// Eagerly resolve the route when it wasn't provided via render
@@ -328,21 +387,27 @@ export class FetchState implements AstroFetchState {
 	}
 
 	/**
-	 * Triggers a rewrite. Delegates to the Rewrites handler.
+	 * Triggers a rewrite. Delegates to the rewrites handler module.
 	 */
 	rewrite(payload: RewritePayload): Promise<Response> {
-		return (this.#rewrites ??= new Rewrites()).execute(this, payload);
+		return executeRewrite(this, payload);
 	}
 
 	/**
 	 * Creates the SSR result for the current page render.
 	 */
 	async createResult(mod: ComponentInstance, ctx: ActionAPIContext): Promise<SSRResult> {
-		const pipeline = this.pipeline;
-		const { clientDirectives, inlinedScripts, compressHTML, manifest, renderers, resolve } =
-			pipeline;
+		const manifest = this.manifest;
+		// `getEnvironment` is read at point of use (not captured at construction)
+		// so mid-life re-registrations (build's two-phase init) are observed.
+		const env = getEnvironment(manifest);
+		const { clientDirectives, inlinedScripts, compressHTML } = manifest;
+		const renderers = env.getRenderers(manifest);
+		// One arrow per `createResult` call (once per page render / rewrite),
+		// not per render node.
+		const resolve = (specifier: string) => env.resolve(manifest, specifier);
 		const routeData = this.routeData!;
-		const { links, scripts, styles } = await pipeline.headElements(routeData);
+		const { links, scripts, styles } = await env.headElements(manifest, routeData);
 
 		const extraStyleHashes: string[] = [];
 		const extraScriptHashes: string[] = [];
@@ -359,7 +424,7 @@ export class FetchState implements AstroFetchState {
 		}
 
 		const componentMetadata =
-			(await pipeline.componentMetadata(routeData)) ?? manifest.componentMetadata;
+			(await env.componentMetadata(manifest, routeData)) ?? manifest.componentMetadata;
 		const headers = new Headers({ 'Content-Type': 'text/html' });
 		const partial = typeof this.partial === 'boolean' ? this.partial : Boolean(mod.partial);
 		const actionResult = hasActionPayload(this.locals)
@@ -402,7 +467,7 @@ export class FetchState implements AstroFetchState {
 			styles,
 			actionResult,
 			async getServerIslandNameMap() {
-				const serverIslands = await pipeline.getServerIslands();
+				const serverIslands = await getServerIslands(manifest);
 				return serverIslands.serverIslandNameMap ?? new Map();
 			},
 			key: manifest.key,
@@ -426,12 +491,27 @@ export class FetchState implements AstroFetchState {
 			cspDestination: manifest.csp?.cspDestination ?? (routeData.prerender ? 'meta' : 'header'),
 			shouldInjectCspMetaTags,
 			cspAlgorithm,
+			directives: manifest.csp?.directives ? [...manifest.csp.directives] : [],
+			// Deprecated flat fields, kept for back-compat. Seeded from the manifest; the runtime CSP
+			// API updates the structured `scriptDirective`/`styleDirective` below (which the renderer
+			// reads), not these.
 			scriptHashes: manifest.csp?.scriptHashes ? [...manifest.csp.scriptHashes] : [],
 			scriptResources: manifest.csp?.scriptResources ? [...manifest.csp.scriptResources] : [],
 			styleHashes: manifest.csp?.styleHashes ? [...manifest.csp.styleHashes] : [],
 			styleResources: manifest.csp?.styleResources ? [...manifest.csp.styleResources] : [],
-			directives: manifest.csp?.directives ? [...manifest.csp.directives] : [],
 			isStrictDynamic: manifest.csp?.isStrictDynamic ?? false,
+			// Structured fields (source of truth). Arrays are cloned so per-request runtime inserts
+			// don't mutate the shared manifest.
+			scriptDirective: {
+				resources: manifest.csp?.scriptDirective ? [...manifest.csp.scriptDirective.resources] : [],
+				hashes: manifest.csp?.scriptDirective ? [...manifest.csp.scriptDirective.hashes] : [],
+				strictDynamic: manifest.csp?.scriptDirective?.strictDynamic ?? false,
+			},
+			styleDirective: {
+				resources: manifest.csp?.styleDirective ? [...manifest.csp.styleDirective.resources] : [],
+				hashes: manifest.csp?.styleDirective ? [...manifest.csp.styleDirective.hashes] : [],
+			},
+			speculationRulesContent: manifest.csp?.speculationRulesContent,
 			internalFetchHeaders: manifest.internalFetchHeaders,
 		};
 
@@ -469,11 +549,7 @@ export class FetchState implements AstroFetchState {
 		Object.defineProperty(Astro, 'slots', {
 			get: () => {
 				if (!_slots) {
-					_slots = new Slots(
-						result,
-						slotValues,
-						this.pipeline.logger,
-					) as unknown as AstroGlobal['slots'];
+					_slots = new Slots(result, slotValues, this.logger) as unknown as AstroGlobal['slots'];
 				}
 				return _slots;
 			},
@@ -490,7 +566,7 @@ export class FetchState implements AstroFetchState {
 		apiContext: ActionAPIContext,
 	): Omit<AstroGlobal, 'props' | 'self' | 'slots'> {
 		const state = this;
-		const { cookies, locals, params, pipeline, url } = this;
+		const { cookies, locals, params, logger, url } = this;
 		const { response } = result;
 		const redirect = (path: string, status = 302) => {
 			if ((state.request as any)[responseSentSymbol]) {
@@ -530,7 +606,7 @@ export class FetchState implements AstroFetchState {
 			rewrite,
 			request: this.request,
 			response,
-			site: pipeline.site,
+			site: getSite(this.manifest),
 			getActionResult: createGetActionResult(locals),
 			get callAction() {
 				return callAction;
@@ -545,13 +621,13 @@ export class FetchState implements AstroFetchState {
 			get logger(): APIContext['logger'] {
 				return {
 					info(msg: string) {
-						pipeline.logger.info(null, msg);
+						logger.info(null, msg);
 					},
 					warn(msg: string) {
-						pipeline.logger.warn(null, msg);
+						logger.warn(null, msg);
 					},
 					error(msg: string) {
-						pipeline.logger.error(null, msg);
+						logger.error(null, msg);
 					},
 				};
 			},
@@ -563,7 +639,7 @@ export class FetchState implements AstroFetchState {
 	}
 
 	getClientAddress(): string {
-		const { pipeline, clientAddress } = this;
+		const { clientAddress } = this;
 		const routeData = this.routeData!;
 
 		if (routeData.prerender) {
@@ -577,10 +653,10 @@ export class FetchState implements AstroFetchState {
 			return clientAddress;
 		}
 
-		if (pipeline.adapterName) {
+		if (this.manifest.adapterName) {
 			throw new AstroError({
 				...AstroErrorData.ClientAddressNotAvailable,
-				message: AstroErrorData.ClientAddressNotAvailable.message(pipeline.adapterName),
+				message: AstroErrorData.ClientAddressNotAvailable.message(this.manifest.adapterName),
 			});
 		}
 
@@ -593,33 +669,68 @@ export class FetchState implements AstroFetchState {
 
 	getCsp(): APIContext['csp'] {
 		const state = this;
-		const { pipeline } = this;
-		if (!pipeline.manifest.csp) {
-			if (pipeline.runtimeMode === 'production') {
-				pipeline.logger.warn(
+		if (!this.manifest.csp) {
+			if (getEnvironment(this.manifest).runtimeMode === 'production') {
+				this.logger.warn(
 					'csp',
 					`context.csp was used when rendering the route ${colors.green(state.routeData!.route)}, but CSP was not configured. For more information, see https://docs.astro.build/en/reference/configuration-reference/#securitycsp`,
 				);
 			}
 			return undefined;
 		}
+		// Dedupe fallback warnings to once per family+kind for the lifetime of this request.
+		const warnedFallback = new Set<string>();
+		const warnFallback = (family: 'script' | 'style', kind: CspKind) => {
+			if (kind === 'default' || !state.result) {
+				return;
+			}
+			const directive =
+				family === 'script' ? state.result.scriptDirective : state.result.styleDirective;
+			// Astro's element hashes are folded into the `-elem` directive automatically, so the
+			// footgun is specifically user-provided `default`-kind resources on the general directive,
+			// which do NOT carry over to the more specific directive.
+			const defaultResources = directive.resources
+				.map(normalizeCspResourceEntry)
+				.filter((entry) => entry.kind === 'default')
+				.map((entry) => entry.resource);
+			if (defaultResources.length === 0) {
+				return;
+			}
+			const key = `${family}:${kind}`;
+			if (warnedFallback.has(key)) {
+				return;
+			}
+			warnedFallback.add(key);
+			const general = `${family}-src`;
+			const specific = `${general}-${kind === 'element' ? 'elem' : 'attr'}`;
+			state.logger.warn(
+				'csp',
+				`A resource was added to \`${specific}\`, but \`${general}\` also defines custom resources (${defaultResources.join(
+					' ',
+				)}). Because \`${specific}\` overrides \`${general}\` for its scope (browsers do not fall back), those resources will not apply there. Add them to \`${specific}\` as well if needed.`,
+			);
+		};
 		return {
 			insertDirective(payload) {
 				if (state.result) {
 					state.result.directives = pushDirective(state.result.directives, payload);
 				}
 			},
-			insertScriptResource(resource) {
-				state.result?.scriptResources.push(resource);
+			insertScriptResource(payload) {
+				if (!state.result) return;
+				warnFallback('script', normalizeCspResourceEntry(payload).kind);
+				state.result.scriptDirective.resources.push(payload);
 			},
-			insertStyleResource(resource) {
-				state.result?.styleResources.push(resource);
+			insertStyleResource(payload) {
+				if (!state.result) return;
+				warnFallback('style', normalizeCspResourceEntry(payload).kind);
+				state.result.styleDirective.resources.push(payload);
 			},
-			insertStyleHash(hash) {
-				state.result?.styleHashes.push(hash);
+			insertStyleHash(payload) {
+				state.result?.styleDirective.hashes.push(payload);
 			},
-			insertScriptHash(hash) {
-				state.result?.scriptHashes.push(hash);
+			insertScriptHash(payload) {
+				state.result?.scriptDirective.hashes.push(payload);
 			},
 		};
 	}
@@ -627,7 +738,7 @@ export class FetchState implements AstroFetchState {
 	computeCurrentLocale() {
 		const {
 			url,
-			pipeline: { i18n },
+			manifest: { i18n },
 			routeData,
 		} = this;
 		if (!i18n || !routeData) return;
@@ -690,7 +801,7 @@ export class FetchState implements AstroFetchState {
 
 	computePreferredLocale() {
 		const {
-			pipeline: { i18n },
+			manifest: { i18n },
 			request,
 		} = this;
 		if (!i18n) return;
@@ -699,7 +810,7 @@ export class FetchState implements AstroFetchState {
 
 	computePreferredLocaleList() {
 		const {
-			pipeline: { i18n },
+			manifest: { i18n },
 			request,
 		} = this;
 		if (!i18n) return;
@@ -715,8 +826,8 @@ export class FetchState implements AstroFetchState {
 		if (this.componentInstance) return this.componentInstance;
 		if (this.#componentInstancePromise) return this.#componentInstancePromise;
 
-		this.#componentInstancePromise = this.pipeline
-			.getComponentByRoute(this.routeData!)
+		this.#componentInstancePromise = getEnvironment(this.manifest)
+			.getComponentByRoute(this.manifest, this.routeData!)
 			.then((mod) => {
 				this.componentInstance = mod;
 				return mod;
@@ -803,7 +914,7 @@ export class FetchState implements AstroFetchState {
 				get() {
 					if (!warned) {
 						warned = true;
-						state.pipeline.logger.warn(
+						state.logger.warn(
 							'session',
 							'`Astro.session` was accessed but no session storage is configured. ' +
 								'Either configure the storage manually or use an adapter that provides session storage. ' +
@@ -852,8 +963,6 @@ export class FetchState implements AstroFetchState {
 	}
 
 	#resolveRouteData(): void {
-		const pipeline = this.pipeline;
-
 		// Fast path: routeData was provided via render options (build, dev
 		// with adapter).
 		if (this.routeData) {
@@ -864,16 +973,16 @@ export class FetchState implements AstroFetchState {
 		// this.pathname is already fully decoded by #computePathname
 		// (which iteratively decodes all encoding levels), so no
 		// additional decoding is needed here.
-		const matched = pipeline.matchRoute(this.pathname);
+		const matched = matchRoute(this.manifest, this.pathname);
 		// In production SSR, prerendered routes are served as static files
 		// by the hosting layer and should not be rendered by the app.
 		// When the first match is a prerendered *dynamic* route, try to find
 		// a non-prerendered route that can serve this path. Dynamic prerendered
 		// routes only cover their specific static paths, so an SSR route with
 		// the same pattern should handle all other URLs.
-		if (matched && matched.prerender && pipeline.manifest.serverLike) {
+		if (matched && matched.prerender && this.manifest.serverLike) {
 			if (matched.params.length > 0) {
-				const allMatches = pipeline.matchAllRoutes(this.pathname);
+				const allMatches = matchAllRoutes(this.manifest, this.pathname);
 				this.routeData = allMatches.find((r) => !r.prerender);
 			} else {
 				this.routeData = undefined;
@@ -881,12 +990,12 @@ export class FetchState implements AstroFetchState {
 		} else {
 			this.routeData = matched;
 		}
-		pipeline.logger.debug('router', 'Astro matched the following route for ' + this.request.url);
-		pipeline.logger.debug('router', 'RouteData:\n' + this.routeData);
+		this.logger.debug('router', 'Astro matched the following route for ' + this.request.url);
+		this.logger.debug('router', 'RouteData:\n' + this.routeData);
 
 		// Fall back to a 404 route so middleware can still run.
 		if (!this.routeData) {
-			const custom404 = getCustom404Route(pipeline.manifestData);
+			const custom404 = getCustom404Route(getRouteTable(this.manifest));
 			// Only use SSR 404 routes here. Prerendered 404 pages are already
 			// built to static HTML, so the pipeline can't render them at
 			// runtime. Leaving routeData unset lets the error handler serve
@@ -896,43 +1005,49 @@ export class FetchState implements AstroFetchState {
 			}
 		}
 		if (!this.routeData) {
-			pipeline.logger.debug('router', "Astro hasn't found routes that match " + this.request.url);
-			pipeline.logger.debug('router', "Here's the available routes:\n", pipeline.manifestData);
+			this.logger.debug('router', "Astro hasn't found routes that match " + this.request.url);
+			this.logger.debug('router', "Here's the available routes:\n", getRouteTable(this.manifest));
 			return;
 		}
 		this.#stripHtmlExtension();
 	}
 
 	/**
-	 * Strips the pipeline's base from the request URL, prepends a forward
-	 * slash, and decodes the pathname. Falls back to the raw (not decoded)
-	 * pathname if `decodeURI` throws.
+	 * Strips the manifest's base from a normalized request pathname and prepends
+	 * a forward slash.
 	 *
 	 * Mirrors `BaseApp.removeBase`, including the
 	 * `collapseDuplicateLeadingSlashes` fix that prevents middleware
 	 * authorization bypass when the URL starts with `//`.
 	 */
-	#computePathname(url: URL): string {
-		let pathname = collapseDuplicateLeadingSlashes(url.pathname);
-		const base = this.pipeline.manifest.base;
+	#computePathname(normalizedPathname: string): string {
+		let pathname = collapseDuplicateLeadingSlashes(normalizedPathname);
+		const base = this.manifest.base;
 		if (pathname.startsWith(base)) {
 			const baseWithoutTrailingSlash = removeTrailingForwardSlash(base);
 			pathname = pathname.slice(baseWithoutTrailingSlash.length + 1);
 		}
-		pathname = prependForwardSlash(pathname);
+		return prependForwardSlash(pathname);
+	}
+
+	/**
+	 * Decodes and normalizes the public request pathname before deriving the
+	 * separate pathname used for route matching.
+	 */
+	#normalizePathname(pathname: string): string {
 		try {
-			return validateAndDecodePathname(pathname);
+			pathname = validateAndDecodePathname(pathname);
 		} catch (e: any) {
 			// The path was encoded too many times to fully decode. Mark it so
 			// the handler can reject the request with a 400 before middleware
 			// or routing run, instead of working with a half-decoded path.
 			if (e instanceof MultiLevelEncodingError) {
 				this.invalidEncoding = true;
-				return pathname;
+			} else {
+				this.logger.error(null, e.toString());
 			}
-			this.pipeline.logger.error(null, e.toString());
-			return pathname;
 		}
+		return collapseDuplicateSlashes(pathname);
 	}
 
 	/**
@@ -946,7 +1061,7 @@ export class FetchState implements AstroFetchState {
 	 */
 	#applyForwardedHeaders(): void {
 		const headers = this.request.headers;
-		const allowedDomains = this.pipeline.manifest.allowedDomains;
+		const allowedDomains = this.manifest.allowedDomains;
 
 		const validated = validateForwardedHeaders(
 			getFirstForwardedValue(headers.get('x-forwarded-proto') ?? undefined),
@@ -993,18 +1108,12 @@ export class FetchState implements AstroFetchState {
 		// request.url stays in sync with this.url. Request.url is a
 		// readonly string, so we must create a new Request object. The
 		// constructor carries over method, headers, body (incl. stream +
-		// duplex) and signal from the old request.
-		const oldRequest = this.request;
-		this.request = new Request(this.url, oldRequest);
-		// Re-attach `appSymbol`: the rest of the pipeline resolves the app
-		// via `getApp(state.request)` (see core/fetch/index.ts), so the new
-		// Request must carry it. We copy only this known Astro symbol.
-		// Other request-bound state is either already captured on
-		// `this` (clientAddress) or set after this point (originPathname).
-		const app = Reflect.get(oldRequest, appSymbol);
-		if (app !== undefined) {
-			Reflect.set(this.request, appSymbol, app);
-		}
+		// duplex) and signal from the original request. Symbols are not
+		// carried over, and don't need to be: nothing resolves anything off
+		// the request — static data comes from `this.manifest`, and render
+		// options were already captured in the constructor before this
+		// reconstruction runs.
+		this.request = new Request(this.url, this.request);
 	}
 
 	/**
@@ -1019,17 +1128,16 @@ export class FetchState implements AstroFetchState {
 			this.props = this.initialProps;
 			return this.props;
 		}
-		const pipeline = this.pipeline;
 		const mod = await this.loadComponentInstance();
 		this.props = await getProps({
 			mod,
 			routeData: this.routeData!,
-			routeCache: pipeline.routeCache,
+			routeCache: getRouteCache(this.manifest),
 			pathname: this.pathname,
-			logger: pipeline.logger,
-			serverLike: pipeline.manifest.serverLike,
-			base: pipeline.manifest.base,
-			trailingSlash: pipeline.manifest.trailingSlash,
+			logger: this.logger,
+			serverLike: this.manifest.serverLike,
+			base: this.manifest.base,
+			trailingSlash: this.manifest.trailingSlash,
 		});
 		return this.props;
 	}
@@ -1072,7 +1180,7 @@ export class FetchState implements AstroFetchState {
 				return state.computePreferredLocaleList();
 			},
 			request: this.request,
-			site: this.pipeline.site,
+			site: getSite(this.manifest),
 			url: this.url,
 			get originPathname() {
 				return getOriginPathname(state.request);
@@ -1083,13 +1191,13 @@ export class FetchState implements AstroFetchState {
 			get logger(): APIContext['logger'] {
 				return {
 					info(msg: string) {
-						state.pipeline.logger.info(null, msg);
+						state.logger.info(null, msg);
 					},
 					warn(msg: string) {
-						state.pipeline.logger.warn(null, msg);
+						state.logger.warn(null, msg);
 					},
 					error(msg: string) {
-						state.pipeline.logger.error(null, msg);
+						state.logger.error(null, msg);
 					},
 				};
 			},
@@ -1124,7 +1232,6 @@ export class FetchState implements AstroFetchState {
 			return await state.rewrite(reroutePayload);
 		};
 
-		Reflect.set(actionApiContext, pipelineSymbol, this.pipeline);
 		(actionApiContext as any)[fetchStateSymbol] = this;
 
 		this.apiContext = Object.assign(actionApiContext, {
